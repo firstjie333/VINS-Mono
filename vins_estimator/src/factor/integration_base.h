@@ -32,7 +32,7 @@ class IntegrationBase
         dt_buf.push_back(dt);
         acc_buf.push_back(acc);
         gyr_buf.push_back(gyr);
-        propagate(dt, acc, gyr);
+        propagate(dt, acc, gyr);  // 预积分传播  
     }
 
     void repropagate(const Eigen::Vector3d &_linearized_ba, const Eigen::Vector3d &_linearized_bg)
@@ -51,6 +51,17 @@ class IntegrationBase
             propagate(dt_buf[i], acc_buf[i], gyr_buf[i]);
     }
 
+
+    /** midPointIntegration()函数完成了离散中值预积分的更新计算，以及误差状态方程 F矩阵与V矩阵的计算，
+    // 最后更新预积分运动方程关于上一刻预积分的jacobian矩阵与误差状态的协方差矩阵。
+     * 
+     * 
+     * _acc_0, _gyr_0 : 上一时刻IMU测量值
+     * _acc_1, _gyr_1 : 当前时刻IMU测量值
+     * delta_p, delta_q, delta_v : 上一时刻预积分量
+     * linearized_ba, linearized_bg: 上一时刻imu偏置.
+     *  */
+
     void midPointIntegration(double _dt, 
                             const Eigen::Vector3d &_acc_0, const Eigen::Vector3d &_gyr_0,
                             const Eigen::Vector3d &_acc_1, const Eigen::Vector3d &_gyr_1,
@@ -60,32 +71,57 @@ class IntegrationBase
                             Eigen::Vector3d &result_linearized_ba, Eigen::Vector3d &result_linearized_bg, bool update_jacobian)
     {
         //ROS_INFO("midpoint integration");
+        
+      
+        // delta_q: 上一时间的状态 
         Vector3d un_acc_0 = delta_q * (_acc_0 - linearized_ba);
-        Vector3d un_gyr = 0.5 * (_gyr_0 + _gyr_1) - linearized_bg;
+        // 认为前后两帧偏置linearized_bg不变   // 平均角速度
+        Vector3d un_gyr = 0.5 * (_gyr_0 + _gyr_1) - linearized_bg; 
+        // t+1：预积分旋转部分更新  : 与角速度相关 
+        // ! ？？？ 
+        // 四元数对时间的导数： q' = q* [0, 1/2w]T （高翔）  q' = q* [1, 1/2w *delta t]T 论文解释？？？？
+        // 旋转矩阵对时间的到时 R' = R * w^
         result_delta_q = delta_q * Quaterniond(1, un_gyr(0) * _dt / 2, un_gyr(1) * _dt / 2, un_gyr(2) * _dt / 2);
+        // t+1：加速度
         Vector3d un_acc_1 = result_delta_q * (_acc_1 - linearized_ba);
+        // t——t+1：平均加速度
         Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
+        // t+1： 位置 离散预积分
         result_delta_p = delta_p + delta_v * _dt + 0.5 * un_acc * _dt * _dt;
+        // t+1 ：速度 离散预积分
         result_delta_v = delta_v + un_acc * _dt;
+
+        // 偏置不变  
         result_linearized_ba = linearized_ba;
-        result_linearized_bg = linearized_bg;         
+        result_linearized_bg = linearized_bg;   
+
+        // 上面的  平均加速度 和 平均角速度 应该受bias的影响 
+
 
         if(update_jacobian)
         {
+
             Vector3d w_x = 0.5 * (_gyr_0 + _gyr_1) - linearized_bg;
             Vector3d a_0_x = _acc_0 - linearized_ba;
             Vector3d a_1_x = _acc_1 - linearized_ba;
             Matrix3d R_w_x, R_a_0_x, R_a_1_x;
 
+            // 平均角速度 的反对称矩阵
             R_w_x<<0, -w_x(2), w_x(1),
                 w_x(2), 0, -w_x(0),
                 -w_x(1), w_x(0), 0;
+            
+            // body 坐标系下 t时刻 加速度 的反对称矩阵
             R_a_0_x<<0, -a_0_x(2), a_0_x(1),
                 a_0_x(2), 0, -a_0_x(0),
                 -a_0_x(1), a_0_x(0), 0;
+            
+            // body 坐标系下 t+1时刻 加速度 的反对称矩阵
             R_a_1_x<<0, -a_1_x(2), a_1_x(1),
                 a_1_x(2), 0, -a_1_x(0),
                 -a_1_x(1), a_1_x(0), 0;
+
+             // 误差状态运动方程 ： deltaZi+1 = F*deltaZi + V*N
 
             MatrixXd F = MatrixXd::Zero(15, 15);
             F.block<3, 3>(0, 0) = Matrix3d::Identity();
@@ -138,6 +174,7 @@ class IntegrationBase
         Vector3d result_linearized_ba;
         Vector3d result_linearized_bg;
 
+        //中点积分方法
         midPointIntegration(_dt, acc_0, gyr_0, _acc_1, _gyr_1, delta_p, delta_q, delta_v,
                             linearized_ba, linearized_bg,
                             result_delta_p, result_delta_q, result_delta_v,
@@ -145,13 +182,26 @@ class IntegrationBase
 
         //checkJacobian(_dt, acc_0, gyr_0, acc_1, gyr_1, delta_p, delta_q, delta_v,
         //                    linearized_ba, linearized_bg);
+        
+        //更新PQV
         delta_p = result_delta_p;
         delta_q = result_delta_q;
         delta_v = result_delta_v;
+        
+        
+        //更新偏置
         linearized_ba = result_linearized_ba;
         linearized_bg = result_linearized_bg;
+
+        // 注意旋转四元数  要归一化  
         delta_q.normalize();
+
+
+        //时间进行累加
         sum_dt += dt;
+
+
+        //预积分完后，更新当前的线加速度和角速度为上一时刻的线加速度和角速度
         acc_0 = acc_1;
         gyr_0 = gyr_1;  
      

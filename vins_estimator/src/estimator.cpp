@@ -83,17 +83,24 @@ void Estimator::clearState()
 
 void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity)
 {
+    //1.判断是不是第一个imu消息，如果是第一个imu消息，则将当前传入的线加速度和角速度作为初始的加速度和角速度
     if (!first_imu)
     {
         first_imu = true;
         acc_0 = linear_acceleration;
         gyr_0 = angular_velocity;
     }
-
+    /**
+     *  2.创建预积分对象
+     * 首先，pre_integrations是一个数组，里面存放了(WINDOW_SIZE + 1)个指针，指针指向的类型是IntegrationBase的对象
+    */
+     */
     if (!pre_integrations[frame_count])
     {
         pre_integrations[frame_count] = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
     }
+
+    //frame_count==0表示此时滑动窗口中还没有图像帧数据，所以先不进行预积分
     if (frame_count != 0)
     {
         pre_integrations[frame_count]->push_back(dt, linear_acceleration, angular_velocity);
@@ -105,16 +112,47 @@ void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const
         angular_velocity_buf[frame_count].push_back(angular_velocity);
 
         int j = frame_count;         
-        Vector3d un_acc_0 = Rs[j] * (acc_0 - Bas[j]) - g;
-        Vector3d un_gyr = 0.5 * (gyr_0 + angular_velocity) - Bgs[j];
-        Rs[j] *= Utility::deltaQ(un_gyr * dt).toRotationMatrix();
-        Vector3d un_acc_1 = Rs[j] * (linear_acceleration - Bas[j]) - g;
-        Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
-        Ps[j] += dt * Vs[j] + 0.5 * dt * dt * un_acc;
-        Vs[j] += dt * un_acc;
+        Vector3d un_acc_0 = Rs[j] * (acc_0 - Bas[j]) - g; // t时刻的加速度 un_acc_0
+        Vector3d un_gyr = 0.5 * (gyr_0 + angular_velocity) - Bgs[j]; // t、t+1 时刻 平均角速度
+        // t+1当前时刻陀螺仪的姿态（旋转）矩阵。这里其实是在上一时刻的旋转矩阵基础上和当前时刻的旋转增量相乘得到的
+        Rs[j] *= Utility::deltaQ(un_gyr * dt).toRotationMatrix(); 
+        Vector3d un_acc_1 = Rs[j] * (linear_acceleration - Bas[j]) - g; // t+1时刻的加速度 un_acc_1
+        Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);// t、t+1 时刻 平均加速度
+        Ps[j] += dt * Vs[j] + 0.5 * dt * dt * un_acc; // 位移（位置）更新，位置是在之前的基础上加上当前的位移量，使用的是位移公式：s = v*t + 1/2*a*t^2
+        Vs[j] += dt * un_acc; //速度更新，使用的是速度公式：v = a * t a是加速度，t是时间
+
+        // 即： Rs[j] ，Ps[j] ，Vs[j]， acc_0， gyr_0 都会更新
     }
     acc_0 = linear_acceleration;
     gyr_0 = angular_velocity;
+
+
+    /** 解释
+     * 
+     * 2）对滑动窗口内每个帧创建预积分对象。
+     * 每新到一个图像帧，就会创建一个IntegrationBase对象存入pre_integrations数组当中。
+     * 每次更新的acc_0和gyr_0作为IMU上一个状态时候的线加速度和角速度值，
+     * Bas[frame_count]和Bgs[frame_count]为对应于id为frame_count这一帧图像的线加速度偏置和角速度偏置值。
+     * 
+     * 3）预积分是需要和滑动窗口中的图像信息结合起来的，
+     * frame_count表示滑动窗口中图像数据的个数，
+     * 当frame_count==0的时候表示滑动窗口中还没有图像帧数据，
+     * 所以不需要进行预积分，只进行线加速度和角速度初始值的更新。
+     * 
+     * 4. 当frame_count!=0的时候，说明滑动窗口中已经有图像帧的数据了，此时就可以对该图像帧对应的imu进行预积分。
+
+     * 5.  预积分操作就是放在这里IntegrationBase类型对象的push_back函数中的。
+     *          pre_integrations->push_back(double dt, const Eigen::Vector3d &acc, const Eigen::Vector3d &gyr)
+     *                     **** propagate(dt, acc, gyr); ****
+     * 
+     * 6. 更新Rs、Ps和Vs三个数组的值。这三个数组的大小为滑动窗口大小+1，????
+     * 这里按照图像帧的id来计算得到滑动窗口中每个图像帧所对应的旋转矩阵、位置和速度值。
+     * 这三个值在后边进行窗口滑动和进行图像位姿初始化的时候需要使用。
+
+
+
+
+ */ 
 }
 
 void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header)
