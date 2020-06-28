@@ -39,6 +39,15 @@ bool init_feature = 0;
 bool init_imu = 1;
 double last_imu_t = 0;
 
+// 从IMU测量值imu_msg和上一个PVQ递推得到当前PVQ
+// 对单次的IMU测量值做积分得到位移和姿态.
+/**
+*从两帧IMU数据中获得当前位姿的预测思路非常简单:
+无非是求出当前时刻𝑡与下一时刻𝑡+1加速度的均值，
+ 把它作为Δ𝑡时间内的平均加速度，
+ 有了这个平均加速度及当前时刻的初始速度和初始位置，
+ 就可以近似的求出𝑡+1时刻的速度和位置
+*/
 void predict(const sensor_msgs::ImuConstPtr &imu_msg)
 {
     double t = imu_msg->header.stamp.toSec();
@@ -48,31 +57,49 @@ void predict(const sensor_msgs::ImuConstPtr &imu_msg)
         init_imu = 0;
         return;
     }
+
+    //计算当前imu_msg距离上一个imu_msg的时间间隔
     double dt = t - latest_time;
     latest_time = t;
 
+    //获取x,y,z三个方向上的线加速度
     double dx = imu_msg->linear_acceleration.x;
     double dy = imu_msg->linear_acceleration.y;
     double dz = imu_msg->linear_acceleration.z;
     Eigen::Vector3d linear_acceleration{dx, dy, dz};
 
+    //获取x,y,z三个方向上的角速度
     double rx = imu_msg->angular_velocity.x;
     double ry = imu_msg->angular_velocity.y;
     double rz = imu_msg->angular_velocity.z;
     Eigen::Vector3d angular_velocity{rx, ry, rz};
 
-    Eigen::Vector3d un_acc_0 = tmp_Q * (acc_0 - tmp_Ba) - estimator.g;
+    // acc_0：body坐标系下的加速度——t时刻
+    // tmp_Q * (acc_0 - tmp_Ba) : body坐标系下的加速度 - bias ,再通过矩阵转到世界坐标系下
+    // un_acc_0: 世界坐标系下的加速度 = 融合了重力加速度的值 - 重力加速度 
+    Eigen::Vector3d un_acc_0 = tmp_Q * (acc_0 - tmp_Ba) - estimator.g;  //t时刻的加速度
 
+    // gyr_0: 
+    // angular_velocity: 角速度--t+1时刻
+    // tmp_Bg: g的bias 
+    // un_gyr = 0.5 * (gyr_0 + angular_velocity) - tmp_Bg; 平均角速度
     Eigen::Vector3d un_gyr = 0.5 * (gyr_0 + angular_velocity) - tmp_Bg;
+    // tmp_Q是t时刻的姿态， 需要计算出t+1时刻的姿态， 用角速度来近似
+    // Qt+1 = Qt *(平均角速度* delta t)
     tmp_Q = tmp_Q * Utility::deltaQ(un_gyr * dt);
 
-    Eigen::Vector3d un_acc_1 = tmp_Q * (linear_acceleration - tmp_Ba) - estimator.g;
+    Eigen::Vector3d un_acc_1 = tmp_Q * (linear_acceleration - tmp_Ba) - estimator.g; //t+1时刻的加速度
 
+    //平均加速度
     Eigen::Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
 
+    // 运动学公式
+    // s = s0 + v*t + 1/2 * a *t*t
+    // v = v0 + a*t
     tmp_P = tmp_P + dt * tmp_V + 0.5 * dt * dt * un_acc;
     tmp_V = tmp_V + dt * un_acc;
 
+    // 更新存储 加速度 和 角速度
     acc_0 = linear_acceleration;
     gyr_0 = angular_velocity;
 }
@@ -135,15 +162,20 @@ getMeasurements()
     return measurements;
 }
 
+// imu订阅的回调函数为imu_callback，在imu_callback函数中对接收到的imu消息进行处理。
 void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
-{
+{   
+    //用时间戳来判断IMU message是否乱序
     if (imu_msg->header.stamp.toSec() <= last_imu_t)
     {
         ROS_WARN("imu message in disorder!");
         return;
     }
     last_imu_t = imu_msg->header.stamp.toSec();
-
+    
+    
+    //在修改多个线程共享的变量的时候要进行上锁，防止多个线程同时访问该变量
+    //新来的imu_msg放入imu_buf队列当中
     m_buf.lock();
     imu_buf.push(imu_msg);
     m_buf.unlock();
@@ -153,9 +185,16 @@ void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
 
     {
         std::lock_guard<std::mutex> lg(m_state);
+
+        // 预测函数，这里推算的是tmp_P,tmp_Q,tmp_V
+        // 从IMU测量值imu_msg和上一个PVQ递推得到当前PVQ
+        // tmp_P(s:位置) , tep_V(v速度)， tmp_Q ： body->world的变换矩阵
         predict(imu_msg);
         std_msgs::Header header = imu_msg->header;
         header.frame_id = "world";
+
+        // 发布imu_propagate topic
+        //  发布最新的由imu直接递推得到的PQV
         if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
             pubLatestOdometry(tmp_P, tmp_Q, tmp_V, header);
     }
@@ -340,23 +379,34 @@ void process()
 
 int main(int argc, char **argv)
 {
+    //1.相关初始化
+
     ros::init(argc, argv, "vins_estimator");
     ros::NodeHandle n("~");
     ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Info);
+
+    //2.读取参数
     readParameters(n);
+
+
+    //3.设置状态估计器的参数
+    //! ????? 
     estimator.setParameter();
 #ifdef EIGEN_DONT_PARALLELIZE
     ROS_DEBUG("EIGEN_DONT_PARALLELIZE");
 #endif
     ROS_WARN("waiting for image and imu...");
-
+   
+    //4.注册发布器
     registerPub(n);
 
+    //5.订阅topic
     ros::Subscriber sub_imu = n.subscribe(IMU_TOPIC, 2000, imu_callback, ros::TransportHints().tcpNoDelay());
     ros::Subscriber sub_image = n.subscribe("/feature_tracker/feature", 2000, feature_callback);
     ros::Subscriber sub_restart = n.subscribe("/feature_tracker/restart", 2000, restart_callback);
     ros::Subscriber sub_relo_points = n.subscribe("/pose_graph/match_points", 2000, relocalization_callback);
 
+    //6.创建process线程，这个是主线程 重要
     std::thread measurement_process{process};
     ros::spin();
 

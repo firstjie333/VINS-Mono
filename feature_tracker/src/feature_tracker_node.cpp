@@ -25,6 +25,7 @@ bool first_image_flag = true;
 double last_image_time = 0;
 bool init_pub = 0;
 
+// img_callback函数主要是接收了原始图像后对图像帧中的特征点使用光流法进行检测处理
 void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
 {
     if(first_image_flag)
@@ -48,6 +49,8 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
     }
     last_image_time = img_msg->header.stamp.toSec();
     // frequency control
+    // 修改 PUB_THIS_FRAME 的值，决定是否要把检测到的特征点打包成/feature_tracker/featuretopic发出去（FREQ决定每间隔多久）
+    // 这里计算的是每秒发送的image个数，保证每秒钟处理的image不多于FREQ
     if (round(1.0 * pub_count / (img_msg->header.stamp.toSec() - first_image_time)) <= FREQ)
     {
         PUB_THIS_FRAME = true;
@@ -72,10 +75,15 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
         img.step = img_msg->step;
         img.data = img_msg->data;
         img.encoding = "mono8";
+        
+        //  cv_bridge::toCvCopy从ROS的img消息中获得一个图像数据的拷贝。也就是从ROS的sensor_msg中获取到图像数据信息
+        //  cv_bridge在ROS的message和opencv的image之间架起了一座桥梁，将二者进行转换
         ptr = cv_bridge::toCvCopy(img, sensor_msgs::image_encodings::MONO8);
     }
     else
         ptr = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::MONO8);
+
+
 
     cv::Mat show_img = ptr->image;
     TicToc t_r;
@@ -83,9 +91,12 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
     {
         ROS_DEBUG("processing camera %d", i);
         if (i != 1 || !STEREO_TRACK)
+            // 读取图像信息到trackerData中
             trackerData[i].readImage(ptr->image.rowRange(ROW * i, ROW * (i + 1)), img_msg->header.stamp.toSec());
         else
         {
+            // 配置文件中EQUALIZE值为1：if image is too dark or light, trun on equalize to find enough features
+            // 如果图像太暗或太亮，请打开均衡器以找到足够的特征。 
             if (EQUALIZE)
             {
                 cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE();
@@ -100,6 +111,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
 #endif
     }
 
+    // ! ???? 
     for (unsigned int i = 0;; i++)
     {
         bool completed = false;
@@ -109,6 +121,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
         if (!completed)
             break;
     }
+
 
    if (PUB_THIS_FRAME)
    {
@@ -162,6 +175,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
             init_pub = 1;
         }
         else
+            //发布检测到的特征点topic：feature，该topic会被vins_estimator中接收处理
             pub_img.publish(feature_points);
 
         if (SHOW_TRACK)
@@ -177,6 +191,8 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
 
                 for (unsigned int j = 0; j < trackerData[i].cur_pts.size(); j++)
                 {
+                    //根据特征点被追踪的次数，显示他的颜色，越红表示这个特征点看到的越久，
+                    // 一幅图像要是大部分特征点是蓝色，说明前端tracker效果很差了
                     double len = std::min(1.0, 1.0 * trackerData[i].track_cnt[j] / WINDOW_SIZE);
                     cv::circle(tmp_img, trackerData[i].cur_pts[j], 2, cv::Scalar(255 * (1 - len), 0, 255 * len), 2);
                     //draw speed line
@@ -197,6 +213,8 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
             }
             //cv::imshow("vis", stereo_img);
             //cv::waitKey(5);
+            // 这里发布的topic为feature_img，会在Rviz中的tracked_image里进行图像显示，
+            // 图像中的红色圆点就是标记出来的特征点
             pub_match.publish(ptr->toImageMsg());
         }
     }
@@ -205,18 +223,22 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
 
 int main(int argc, char **argv)
 {
+    // ros初始化 + 节点定义
     ros::init(argc, argv, "feature_tracker");
     ros::NodeHandle n("~");
     ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Info);
-    readParameters(n);
+    readParameters(n);//从配置文件中读取参数
 
+    //NUM_OF_CAM为相机个数， 单目为1
     for (int i = 0; i < NUM_OF_CAM; i++)
         trackerData[i].readIntrinsicParameter(CAM_NAMES[i]);
-
+    //鱼眼判断
     if(FISHEYE)
     {
         for (int i = 0; i < NUM_OF_CAM; i++)
         {
+            //读取config路径下的fisheye_mask.jpg图片赋值给fisheye_mask
+            // !鱼眼相机的fisheye_mask.jpg 是什么？？？ （用于去除image信息的边缘噪声）
             trackerData[i].fisheye_mask = cv::imread(FISHEYE_MASK, 0);
             if(!trackerData[i].fisheye_mask.data)
             {
@@ -228,10 +250,13 @@ int main(int argc, char **argv)
         }
     }
 
+    //订阅图像消息，回调函数为img_callback
     ros::Subscriber sub_img = n.subscribe(IMAGE_TOPIC, 100, img_callback);
-
+    //发布类型为PointCloud的消息，该消息为从相机图像中跟踪的特征点
     pub_img = n.advertise<sensor_msgs::PointCloud>("feature", 1000);
+    //发布类型为Image的消息，该话题的消息标出了特征点的图像
     pub_match = n.advertise<sensor_msgs::Image>("feature_img",1000);
+    //发布系统重启消息
     pub_restart = n.advertise<std_msgs::Bool>("restart",1000);
     /*
     if (SHOW_TRACK)

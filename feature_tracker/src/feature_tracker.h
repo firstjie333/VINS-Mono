@@ -34,6 +34,7 @@ class FeatureTracker
 
     void setMask();
 
+    // 添加新追踪到的角点
     void addPoints();
 
     bool updateID(unsigned int i);
@@ -53,8 +54,9 @@ class FeatureTracker
     vector<cv::Point2f> prev_pts, cur_pts, forw_pts;
     vector<cv::Point2f> prev_un_pts, cur_un_pts;
     vector<cv::Point2f> pts_velocity;
-    vector<int> ids;
-    vector<int> track_cnt;
+    vector<int> ids;  //保存了当前追踪到的角点的ID，这个ID非常关键，保存了帧与帧之间角点的匹配关系。
+    vector<int> track_cnt; // 保存了当前追踪到的角点一共被多少帧图像追踪到
+
     map<int, cv::Point2f> cur_un_pts_map;
     map<int, cv::Point2f> prev_un_pts_map;
     camodocal::CameraPtr m_camera;
