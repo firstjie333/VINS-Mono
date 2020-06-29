@@ -91,7 +91,7 @@ class IntegrationBase
         // t+1 ：速度 离散预积分
         result_delta_v = delta_v + un_acc * _dt;
 
-        // 偏置不变  
+        // 偏置不变 , 这里没考虑噪声
         result_linearized_ba = linearized_ba;
         result_linearized_bg = linearized_bg;   
 
